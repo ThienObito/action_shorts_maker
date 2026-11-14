@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "action_shorts_maker": {
+        "type": "local",
+        "command": ["D:\\action_shorts_maker\\venv\\Scripts\\python.exe", "D:\\action_shorts_maker\\mcp_server.py"]
+      }
+    }
+  }
+}
