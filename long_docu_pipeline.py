@@ -23,7 +23,19 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 from config import ROOT, OUTPUTS
 from us_docu_rewriter import rewrite_documentary, format_srt, save_metadata
 from core.docu_postprocess import (align_srt_to_audio, choose_sharp_frame,
-                                  build_master_audio_and_srt, self_verify_output)
+                                  build_master_audio_and_srt, self_verify_output,
+                                  TEXT_BLUR_MODES, detect_text_bands, apply_frosted_blur_text_mask,
+                                  normalize_master_loudness)
+from core.audio_separator import SOURCE_AUDIO_MODES, extract_machine_ambient_audio, overlay_ambient_mix
+
+SHARP_FILTER = ("crop=iw*0.86:ih*0.86,scale=1920:1080:"
+                "flags=lanczos+accurate_rnd+full_chroma_int,cas=strength=0.55,"
+                "unsharp=5:5:0.65:3:3:0.25,eq=contrast=1.06:saturation=1.08:brightness=0.01,"
+                "setsar=1,format=yuv420p")
+FINAL_NVENC = ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr",
+               "-cq", "17", "-b:v", "12M", "-maxrate", "18M", "-bufsize", "24M",
+               "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "10", "-pix_fmt", "yuv420p"]
+VISUAL_NVENC = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "constqp", "-qp", "14", "-pix_fmt", "yuv420p"]
 
 def sanitize_hud_text(text: str, max_chars: int = 42) -> str:
     """Return short ASCII-only HUD text safe for FFmpeg drawtext."""
@@ -85,16 +97,33 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
                               make_intro_hook: bool = False,
                               mute_source_audio: bool = True,
                               speed_up_source: bool = False,
-                              subtitle_path: Path | None = None) -> Path:
+                              subtitle_path: Path | None = None,
+                               source_audio_mode: str = "mute_all",
+                               timeline: list[dict] | None = None,
+                               text_blur_mode: str = "none", render_settings: dict | None = None,
+                               transition_style: str = "none") -> Path:
     """Assemble source video/audio with original narration; retain source framing and provenance."""
     if not local_files:
         raise ValueError("No source media to assemble")
+    if text_blur_mode not in TEXT_BLUR_MODES:
+        raise ValueError(f"Unsupported text_blur_mode: {text_blur_mode}")
+    from core.studio_transitions import STYLES, transition_graph
+    if transition_style not in STYLES:
+        raise ValueError("Unsupported transition_style")
+    render_settings = render_settings or {}
+    if set(render_settings) - {"sharp", "contrast", "blur"} or any(
+            type(v) not in (int, float) or not 0 <= v <= 100 for v in render_settings.values()):
+        raise ValueError("Invalid render_settings (sharp/contrast/blur must be 0..100)")
     narration = folder / "master_audio_mix.wav"
     if not narration.is_file():
         raise FileNotFoundError(f"Mixed master audio required: {narration}")
     report = progress or (lambda _message: None)
     report("Probing source and narration durations")
     source_infos = [_probe(path) for path in local_files]
+    if source_audio_mode != "mute_all" and any(
+            not any(stream.get("codec_type") == "audio" for stream in info["streams"])
+            for info in source_infos):
+        raise ValueError("All sources need audio tracks for source ambience; choose mute_all if any source is silent")
     narr_info = _probe(narration)
     voice_duration = float(narr_info["format"]["duration"])
     source_durations = [float(info["format"]["duration"]) for info in source_infos]
@@ -111,14 +140,15 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
         concat_list = folder / "source_concat.txt"
         concat_list.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in local_files), encoding="utf-8")
         source = folder / "source_concat.mp4"
-        _run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-an", "-c:v", "libx264",
-              "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p", str(source)])
+        _run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c:v", "libx264",
+              "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "192k", str(source)])
         source_info = _probe(source)
         source_infos = [source_info]
         source_durations = [float(source_info["format"]["duration"])]
         total_source = source_durations[0]
     source_video = next(s for s in source_infos[0]["streams"] if s.get("codec_type") == "video")
-    fps = source_video.get("avg_frame_rate") or source_video.get("r_frame_rate") or "30/1"
+    fps = "60"  # Constant output cadence; duplicates frames when the licensed source is slower.
     source_audio = next((s for s in source_infos[0]["streams"] if s.get("codec_type") == "audio"), None)
     source_duration = source_durations[0]
     ranges = sorted(exclude_ranges or [])
@@ -154,15 +184,34 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
         source_durations = [source_duration]
         source_infos = [source_info]
         total_source = source_duration
+    if source_audio_mode != "mute_all":
+        ambient = extract_machine_ambient_audio(source, folder, body_voice_duration, hook_lead, source_audio_mode)
+        if ambient is not None:
+            overlay_ambient_mix(narration, ambient, timeline or [], hook_lead, source_audio_mode)
+    measured_lufs = normalize_master_loudness(narration)
+    report(f"Master mix loudness target -14 LUFS; FFmpeg measured {measured_lufs} LUFS")
     render_srt = subtitle_path or (folder / "english_narration.srt")
-    srt_arg = str(render_srt.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'").replace(" ", r"\ ")
-    video_filter = (
-        "crop=iw*0.86:ih*0.86,"
-        f"subtitles='{srt_arg}':force_style='FontName=Arial,FontSize=15,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BackColour=&H60000000,BorderStyle=1,Outline=1.5,Shadow=1,Alignment=2,MarginV=22',"
-        "scale=1920:1080:flags=lanczos,"
-        "eq=contrast=1.06:saturation=1.08:brightness=0.01,format=yuv420p"
-    )
+    import pysrt
+    master_ass = folder / "master_subtitles.ass"
+    master_ass.write_text(_master_srt_to_ass(pysrt.open(str(render_srt), encoding="utf-8")), encoding="utf-8-sig")
+    (folder / "english_narration.ass").write_text(
+        _master_srt_to_ass(pysrt.open(str(folder / "english_narration.srt"), encoding="utf-8")), encoding="utf-8-sig")
+    ass_arg = str(master_ass.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'").replace(" ", r"\ ")
+    sharp_filter = SHARP_FILTER.replace("cas=strength=0.55", f"cas=strength={render_settings.get('sharp',55)/100:.2f}")
+    sharp_filter = sharp_filter.replace("contrast=1.06", f"contrast={0.48+render_settings.get('contrast',58)/100:.2f}")
+    resolved_blur = text_blur_mode
+    if text_blur_mode == "auto_detect_blur":
+        top, bottom = detect_text_bands(source)
+        resolved_blur = ("both_top_bottom_blur" if top and bottom else
+                         "top_blur_brand" if top else "bottom_blur_sub" if bottom else "none")
+        settings_path = folder / "production_settings.json"
+        if settings_path.is_file():
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings["resolved_text_blur_mode"] = resolved_blur
+            settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    mask_graph, mask_label = apply_frosted_blur_text_mask(
+        1920, 1080, resolved_blur, round(render_settings.get("blur", 88)), "base")
+    video_filter = sharp_filter
     if speed_up_source and total_source > body_voice_duration:
         speed_factor = total_source / max(body_voice_duration, 0.001)
         video_filter = f"setpts=PTS/{speed_factor:.6f}," + video_filter
@@ -186,13 +235,23 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
             f"drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{label}':fontcolor=0xFBBF24:fontsize=18:"
             f"box=1:boxcolor=0x111827@0.88:boxborderw=10:x=24:y=24:"
             f"enable='between(t,{start:.2f},{end:.2f})'")
-    final_vf = video_filter + ("," + ",".join(draw_filters) if draw_filters else "")
+    overlays = f"ass='{ass_arg}'" + ("," + ",".join(draw_filters) if draw_filters else "")
+    if mask_graph or (transition_style != "none" and timeline):
+        if transition_style != "none" and timeline:
+            times = [float(item["start_sec"]) - hook_lead for item in timeline[1:]]
+            effects, _ = transition_graph(transition_style, times, body_voice_duration, input_label="scene_base")
+            final_graph = f"[0:v]{video_filter},fps=60,format=yuv420p[scene_base];{effects};[transitions]null[base]"
+        else:
+            final_graph = f"[0:v]{video_filter}[base]"
+        final_graph += (";" + mask_graph if mask_graph else "") + f";[{mask_label}]{overlays}[rendered]"
+        filter_args = ["-filter_complex", final_graph, "-map", "[rendered]", "-map", "1:a:0"]
+    else:
+        filter_args = ["-vf", f"{video_filter},{overlays}", "-map", "0:v:0", "-map", "1:a:0"]
     render_target = folder / "main_without_hook.mp4"
     hook_path = None
     hook_duration = 0.0
     body_render_source = source
     if make_intro_hook:
-        bgm_path = ensure_royalty_free_bgm(folder)
         hook_parts = []
         part_length = 8.0 / 3.0
         part_fps = 30
@@ -201,20 +260,15 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
             start = max(0.0, min(visual_duration - part_length, visual_duration * pct - part_length / 2))
             part = folder / f"intro_hook_part_{i:02d}.mp4"
             _run(["ffmpeg", "-ss", f"{start:.3f}", "-i", str(source),
-                  "-stream_loop", "-1", "-i", str(bgm_path),
-                   "-vf", f"crop=iw*0.86:ih*0.86,scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
-                        f"fps={part_fps},"
-                        "drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='PRECISION MACHINING':fontcolor=white:fontsize=48:borderw=3:"
-                        "bordercolor=black:x=(w-text_w)/2:y=70:enable='lt(t,4)'",
-                  "-map", "0:v:0", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p",
+                   "-vf", f"{SHARP_FILTER},fps={part_fps}",
+                   "-map", "0:v:0", "-an", *VISUAL_NVENC,
                   "-r", str(part_fps),
                   "-t", f"{part_length:.6f}", str(part)])
             hook_parts.append(part)
         hook_list = folder / "intro_hook_concat.txt"
         hook_list.write_text("\n".join(f"file '{p.resolve().as_posix()}'" for p in hook_parts), encoding="utf-8")
         hook_path = folder / "intro_hook.mp4"
-        _run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(hook_list), "-c:v", "libx264",
-              "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p", "-r", str(part_fps),
+        _run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(hook_list), *VISUAL_NVENC, "-r", str(part_fps),
               "-an", str(hook_path)])
         hook_duration = float(_probe(hook_path)["format"]["duration"])
         render_target = folder / "main_without_hook.mp4"
@@ -228,40 +282,46 @@ def assemble_and_master_video(local_files: list[Path], script: dict, narration: 
         _run(["ffmpeg", "-i", str(narration), "-af", f"atrim=duration={hook_lead:.3f},asetpts=PTS-STARTPTS",
               "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(hook_audio)])
     direct_command = ["ffmpeg", "-i", str(body_render_source), "-i", str(body_audio),
-                      "-map", "0:v:0", "-map", "1:a:0", "-vf", final_vf,
-                      "-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23", "-b:v", "4500k",
-                      "-maxrate", "6000k", "-bufsize", "12000k", "-r", fps,
+                      *filter_args,
+                       *FINAL_NVENC, "-r", fps,
                       "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{body_voice_duration:.3f}", "-shortest", "-max_muxing_queue_size", "4096",
                       "-movflags", "+faststart", str(render_target)]
     _run(direct_command)
     silent_visual = folder / "visual_master_silent.mp4"
-    silent_vf = "crop=iw*0.86:ih*0.86,scale=1920:1080:flags=lanczos,eq=contrast=1.06:saturation=1.08:brightness=0.01,format=yuv420p"
+    silent_vf = sharp_filter
     if speed_up_source and total_source > body_voice_duration:
         silent_vf = f"setpts=PTS/{total_source / max(body_voice_duration, 0.001):.6f}," + silent_vf
     elif speed_up_source and total_source < body_voice_duration:
         silent_vf = f"setpts=PTS/{max(0.01, total_source / max(body_voice_duration, 0.001)):.6f}," + silent_vf
     _run(["ffmpeg", "-i", str(body_render_source), "-vf", silent_vf,
-          "-an", "-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23", "-b:v", "4500k",
-          "-maxrate", "6000k", "-bufsize", "12000k", "-r", fps, "-t", f"{body_voice_duration:.3f}",
-          "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(silent_visual)])
+          "-an", *VISUAL_NVENC, "-r", fps, "-t", f"{body_voice_duration:.3f}",
+          "-movflags", "+faststart", str(silent_visual)])
     if hook_path:
         # Build one common master timeline; concat normalizes formats and keeps clean audio.
         concat_graph = (
             "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
-            "setsar=1,fps=30,format=yuv420p[v0];"
+            "setsar=1,fps=60,format=yuv420p[v0];"
             "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
-            "setsar=1,fps=30,format=yuv420p[v1];"
+            "setsar=1,fps=60,format=yuv420p[v1];"
             "[v0][v1]concat=n=2:v=1:a=0[v]"
         )
         hook_visual = folder / "visual_with_hook_silent.mp4"
         _run(["ffmpeg", "-i", str(hook_path), "-i", str(silent_visual), "-filter_complex", concat_graph,
-               "-map", "[v]", "-an", "-c:v", "h264_nvenc", "-preset", "p3", "-cq", "23",
-               "-b:v", "4500k", "-maxrate", "6000k", "-bufsize", "12000k", "-pix_fmt", "yuv420p",
-               "-r", "30", "-movflags", "+faststart", str(hook_visual)])
+               "-map", "[v]", "-an", *VISUAL_NVENC,
+               "-r", "60", "-movflags", "+faststart", str(hook_visual)])
         hook_visual.replace(silent_visual)
-        _run(["ffmpeg", "-i", str(silent_visual), "-i", str(narration),
-              "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-              "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", str(output)])
+        master_with_hook = folder / "master_with_hook_video.mp4"
+        titled_hook = folder / "intro_hook_titled.mp4"
+        title = _escape_drawtext(str(script.get("title") or "THE MAKING OF IT").upper()[:42])
+        _run(["ffmpeg", "-i", str(hook_path), "-vf",
+              f"drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{title}':fontcolor=white:"
+              "fontsize=48:borderw=3:bordercolor=black:x=(w-text_w)/2:y=70",
+              "-an", *FINAL_NVENC, str(titled_hook)])
+        _run(["ffmpeg", "-i", str(titled_hook), "-i", str(render_target), "-filter_complex", concat_graph,
+              "-map", "[v]", "-an", *FINAL_NVENC, "-r", "60", "-movflags", "+faststart", str(master_with_hook)])
+        _run(["ffmpeg", "-i", str(master_with_hook), "-i", str(narration),
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", str(output)])
     else:
         _run(["ffmpeg", "-i", str(render_target), "-i", str(narration), "-map", "0:v:0", "-map", "1:a:0",
               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -280,7 +340,8 @@ def _slug(urls: list[str], title: str | None = None) -> str:
 
 
 def generate_shorts_funnel(master: Path, script: dict, folder: Path,
-                           durations: tuple[int, int, int] = (25, 25, 25)) -> list[dict]:
+                           durations: tuple[int, int, int] = (25, 25, 25),
+                           text_blur_mode: str = "none", render_settings: dict | None = None) -> list[dict]:
     """Export three captioned portrait cuts from clean silent master and mixed audio."""
     from pysrt import SubRipFile, SubRipTime
     shorts_dir = folder / "shorts"
@@ -297,6 +358,13 @@ def generate_shorts_funnel(master: Path, script: dict, folder: Path,
         raise FileNotFoundError(f"Mixed Shorts audio required: {audio_mix}")
     if not voice_mix.is_file():
         voice_mix = audio_mix
+    render_settings = render_settings or {}
+    resolved_blur = text_blur_mode
+    if text_blur_mode == "auto_detect_blur":
+        resolved_blur = "none"  # Reuse reviewed master detection via production_settings.json.
+        settings_path = folder / "production_settings.json"
+        if settings_path.is_file():
+            resolved_blur = json.loads(settings_path.read_text(encoding="utf-8")).get("resolved_text_blur_mode", "none")
     master_duration = min(float(_probe(visual)["format"]["duration"]),
                           float(_probe(audio_mix)["format"]["duration"]))
     cues = sorted(list(source_srt), key=lambda cue: cue.start.ordinal)
@@ -350,12 +418,14 @@ def generate_shorts_funnel(master: Path, script: dict, folder: Path,
         ass_path.write_text(_shorts_srt_to_ass(clip_srt), encoding="utf-8-sig")
         ass_filter_path = str(ass_path.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'").replace(" ", r"\ ")
         graph = ("[0:v]split[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-                 "crop=1080:1920,boxblur=24:8[back];[fg]crop=ih:ih:(iw-ih)/2:0,scale=1080:1080[front];"
-                 f"[back][front]overlay=(W-w)/2:(H-h)/2,ass='{ass_filter_path}'[vout]")
+                  "crop=1080:1920,boxblur=24:8[back];[fg]crop=ih:ih:(iw-ih)/2:0,scale=1080:1080[front];"
+                  "[back][front]overlay=(W-w)/2:(H-h)/2[portrait]")
+        mask_graph, mask_label = apply_frosted_blur_text_mask(
+            1080, 1920, resolved_blur, round(render_settings.get("blur", 88)), "portrait")
+        graph += (";" + mask_graph if mask_graph else "") + f";[{mask_label}]ass='{ass_filter_path}'[vout]"
         output = shorts_dir / name
         _run(["ffmpeg", "-ss", f"{start:.3f}", "-i", str(visual), "-t", f"{end-start:.3f}",
-              "-filter_complex", graph, "-map", "[vout]", "-c:v", "h264_nvenc", "-preset", "p3", "-cq", "24", "-b:v", "2500k",
-              "-maxrate", "3500k", "-bufsize", "6000k", "-r", "30", "-pix_fmt", "yuv420p", "-an", str(output)])
+              "-filter_complex", graph, "-map", "[vout]", *FINAL_NVENC, "-r", "30", "-an", str(output)])
         mux_output = output.with_name(output.stem + "_mux.mp4")
         fade_start = max(0, end - start - 0.5)
         import numpy as np
@@ -381,7 +451,7 @@ def generate_shorts_funnel(master: Path, script: dict, folder: Path,
         cta_output = output.with_name(output.stem + "_cta.mp4")
         _run(["ffmpeg", "-i", str(output), "-vf",
                "drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='WATCH FULL BREAKDOWN':fontcolor=white:fontsize=24:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-45",
-              "-map", "0:v:0", "-map", "0:a:0", "-c:v", "h264_nvenc", "-preset", "p3", "-cq", "24",
+               "-map", "0:v:0", "-map", "0:a:0", *FINAL_NVENC,
               "-c:a", "copy", "-shortest", str(cta_output)])
         cta_output.replace(output)
         short_audio_path.unlink(missing_ok=True)
@@ -414,17 +484,139 @@ def _shorts_srt_to_ass(subtitles) -> str:
     return "\n".join(rows) + "\n"
 
 
+def _master_srt_to_ass(subtitles) -> str:
+    """Fixed-resolution, one-line English caption layout for 1920x1080 masters."""
+    def stamp(milliseconds: int) -> str:
+        cs = max(0, int(milliseconds) // 10)
+        h, cs = divmod(cs, 360000)
+        m, cs = divmod(cs, 6000)
+        s, cs = divmod(cs, 100)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+    rows = ["[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080",
+            "WrapStyle: 2", "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,Arial,44,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,1.5,2,55,55,42,1",
+            "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+    for cue in subtitles:
+        words = cue.text.split()
+        if not words:
+            continue
+        groups = [words[i:i+9] for i in range(0, len(words), 9)]
+        span = max(1, cue.end.ordinal - cue.start.ordinal)
+        for index, group in enumerate(groups):
+            a = cue.start.ordinal + span * index // len(groups)
+            b = cue.start.ordinal + span * (index+1) // len(groups)
+            text = " ".join(group).replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+            rows.append(f"Dialogue: 0,{stamp(a)},{stamp(b)},Default,,0,0,0,,{text}")
+    return "\n".join(rows) + "\n"
+
+
+def render_studio_derivative(folder: Path, output: Path, sliders: dict, text_blur_mode: str,
+                             transition_style: str = "none") -> str | None:
+    """Build a new master derivative from independent stems; never replace prior outputs."""
+    if text_blur_mode not in TEXT_BLUR_MODES or text_blur_mode == "auto_detect_blur":
+        raise ValueError("Studio render requires an explicit blur mode")
+    if set(sliders) != {"voice", "bgm", "sfx", "blur", "sharp", "contrast"} or any(
+            type(value) not in (int, float) or not 0 <= value <= 100 for value in sliders.values()):
+        raise ValueError("Six studio sliders must be numeric 0..100")
+    for stem in ("visual_master_silent.mp4", "full_voiceover.wav", "bgm_master.wav", "english_narration.ass"):
+        if not (folder / stem).is_file():
+            raise FileNotFoundError(f"Cannot render without {stem}")
+    from core.studio_transitions import transition_graph
+    timeline_file = folder / "english_narration_timeline.json"
+    timeline = json.loads(timeline_file.read_text(encoding="utf-8")) if timeline_file.is_file() else {}
+    duration = float(_probe(folder / "visual_master_silent.mp4")["format"]["duration"])
+    chapters = [float(segment["start_sec"]) for segment in timeline.get("segments", [])[1:]]
+    transitions, transition_label = transition_graph(transition_style, chapters, duration)
+    vfilter = (f"cas=strength={abs(sliders['sharp']-55)/100:.2f},"
+               f"eq=contrast={1+(sliders['contrast']-58)/100:.2f},format=yuv420p")
+    mask, label = apply_frosted_blur_text_mask(1920, 1080, text_blur_mode, round(sliders["blur"]), "base")
+    ass = str((folder / "english_narration.ass").resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'").replace(" ", r"\ ")
+    inputs = ["-i", str(folder / "visual_master_silent.mp4"),
+              "-i", str(folder / "full_voiceover.wav"), "-i", str(folder / "bgm_master.wav")]
+    has_sfx = (folder / "ambient_bed.wav").is_file()
+    if has_sfx:
+        inputs += ["-i", str(folder / "ambient_bed.wav")]
+    import tempfile
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="_xfade_", dir=output.parent) as temp_dir:
+        if transition_style == "cross_dissolve" and chapters:
+            # Tiny per-boundary xfade clips, overlaid onto the unchanged master clock.
+            # Never split and buffer the entire 9-minute master in FFmpeg.
+            video_source = folder / "visual_master_silent.mp4"
+            boundaries = [t for t in chapters if .5 < t < duration - .5]
+            effects = []
+            first_index = 4 if has_sfx else 3
+            for index, t in enumerate(boundaries):
+                clip = Path(temp_dir) / f"transition_{index}.mp4"
+                start = t - .15
+                clip_graph = ("[0:v]fps=60,trim=duration=0.300,setpts=PTS-STARTPTS,format=yuv420p[a];"
+                              "[1:v]fps=60,trim=duration=0.300,setpts=PTS-STARTPTS,format=yuv420p[b];"
+                              "[a][b]xfade=transition=fade:duration=0.250:offset=0.050[v]")
+                subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{start:.3f}",
+                                "-i", str(video_source), "-ss", f"{t:.3f}", "-i", str(video_source),
+                                "-filter_complex", clip_graph, "-map", "[v]", "-t", "0.350",
+                                "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", str(clip)],
+                               check=True, capture_output=True, timeout=180)
+                inputs += ["-i", str(clip)]
+                effects.append((first_index + index, start))
+            pieces = ["[0:v]null[transition_base]"]
+            previous = "transition_base"
+            for index, (input_index, start) in enumerate(effects):
+                out = "transitions" if index == len(effects) - 1 else f"transition_{index}"
+                pieces.append(f"[{input_index}:v]setpts=PTS+{start:.3f}/TB[effect_{index}]")
+                pieces.append(f"[{previous}][effect_{index}]overlay=0:0:shortest=0:eof_action=pass:"
+                              f"enable='between(t,{start:.3f},{start+.350:.3f})'[{out}]")
+                previous = out
+            transitions = ";".join(pieces)
+        graph = f"{transitions};[{transition_label}]{vfilter}[base];" + (mask + ";" if mask else "") + f"[{label}]ass='{ass}'[vout];"
+        graph += f"[1:a]volume={(sliders['voice']-94)*.18:.2f}dB[vo];"
+        graph += f"[2:a]volume={(sliders['bgm']-36)*.18:.2f}dB[bg];"
+        if has_sfx:
+            graph += f"[3:a]volume={(sliders['sfx']-54)*.18:.2f}dB[fx];[vo][bg][fx]amix=inputs=3:normalize=0,"
+        else:
+            graph += "[vo][bg]amix=inputs=2:normalize=0,"
+        graph += "loudnorm=I=-14:TP=-1.0:LRA=11:print_format=json[aout]"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        command = ["ffmpeg", "-y", "-nostdin", "-v", "info", *inputs, "-filter_complex", graph,
+                   "-map", "[vout]", "-map", "[aout]", *FINAL_NVENC,
+                   "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(output)]
+        try:
+            rendered = subprocess.run(command, check=True, capture_output=True, timeout=10800)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(exc.stderr.decode("utf-8", errors="replace")[-1800:]) from exc
+        details = rendered.stderr.decode("utf-8", errors="replace")
+        match = re.search(r'"output_i"\s*:\s*"([^"\n]+)"', details)
+        return match.group(1) if match else None
+
+
 def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_machining",
                         target_duration_sec: int = 600, progress=None, use_asr: bool = False,
                         clean_outro_sec: float = 0,
                         thumbnail_range: tuple[float, float] | None = None,
                         voice: str = "en-US-ChristopherNeural",
                         exclude_ranges: list[tuple[float, float]] | None = None,
-                        make_intro_hook: bool = False, make_shorts: bool = True,
+                        make_intro_hook: bool = True, make_shorts: bool = True,
                         existing_project_dir: Path | None = None,
-                        script_override: dict | None = None) -> dict:
-    if not youtube_urls:
-        raise ValueError("youtube_urls must not be empty")
+                        script_override: dict | None = None,
+                         source_audio_mode: str = "mute_all", bgm_style: str = "dynamic_multi",
+                         text_blur_mode: str = "none", render_settings: dict | None = None,
+                         transition_style: str = "none",
+                         local_source_files: list[Path] | None = None) -> dict:
+    if not youtube_urls and not local_source_files:
+        raise ValueError("A URL or local source is required")
+    if local_source_files and (youtube_urls or not existing_project_dir):
+        raise ValueError("Local source requires an existing project and no URLs")
+    if source_audio_mode not in SOURCE_AUDIO_MODES:
+        raise ValueError(f"Unsupported source_audio_mode: {source_audio_mode}")
+    if text_blur_mode not in TEXT_BLUR_MODES:
+        raise ValueError(f"Unsupported text_blur_mode: {text_blur_mode}")
+    from core.studio_transitions import STYLES
+    if transition_style not in STYLES:
+        raise ValueError(f"Unsupported transition_style: {transition_style}")
+    from core.bgm_composer import TRACKS
+    if bgm_style not in ("dynamic_multi", "none", "craftsman", *TRACKS):
+        raise ValueError(f"Unsupported bgm_style: {bgm_style}")
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("ffmpeg and ffprobe must be available in PATH")
     video_ids = [parse_qs(urlparse(url).query).get("v", [""])[0] for url in youtube_urls]
@@ -438,15 +630,36 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
             progress(message)
     local_files = []
     metadata = []
-    for index, url in enumerate(youtube_urls, 1):
+    for index, url in enumerate(youtube_urls or [str(p) for p in local_source_files or []], 1):
+        if local_source_files:
+            local = Path(local_source_files[index-1]).resolve()
+            if local.parent != folder.resolve() or not local.is_file() or not local.name.startswith(f"source_{index:02d}."):
+                raise ValueError("Local source must be a staged source in this project")
+            info = _probe(local)
+            local_files.append(local)
+            metadata.append({"title": local.stem, "duration": float(info["format"]["duration"]),
+                             "url": None, "local_source": local.name})
+            report(f"Using local source {index}/{len(local_source_files)}")
+            continue
         video_id = parse_qs(urlparse(url).query).get("v", [""])[0]
         cache_candidates = []
         for cache_dir in (folder, ROOT / "downloads", ROOT / "inputs", OUTPUTS):
             if cache_dir.exists():
                 cache_candidates.extend(p for p in cache_dir.glob("**/*") if p.is_file()
                                         and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
-                                        and (video_id in p.name or (p.parent == folder and p.name.startswith(f"source_{index:02d}."))))
-        cached = next(iter(cache_candidates), None)
+                                        and ((video_id and video_id in p.name) or
+                                             (p.parent == folder and p.name.startswith(f"source_{index:02d}."))))
+        def height(path: Path) -> int:
+            return int(next(s for s in _probe(path)["streams"] if s.get("codec_type") == "video")["height"])
+        cached = next((p for p in cache_candidates if p.is_file() and height(p) >= 720), None)
+        local_low_res = next((p for p in folder.glob(f"source_{index:02d}.*")
+                              if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+                              and height(p) < 720), None)
+        if local_low_res is not None and local_low_res != cached:
+            rejected = folder / "low_resolution_rejected"
+            rejected.mkdir(exist_ok=True)
+            local_low_res.replace(rejected / local_low_res.name)
+            report(f"Quarantined source below 720p: {local_low_res.name}")
         report(f"Reusing cached source {index}/{len(youtube_urls)}" if cached else f"Downloading source {index}/{len(youtube_urls)}")
         if cached:
             local_files.append(cached)
@@ -456,17 +669,27 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
             except Exception:
                 metadata.append({"title": cached.stem, "duration": None, "url": url})
             continue
-        opts = {"format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        opts = {"format": "bestvideo[height>=1080]+bestaudio/bestvideo[height>=720]+bestaudio/bestvideo+bestaudio/best",
                 "merge_output_format": "mp4", "outtmpl": str(folder / f"source_{index:02d}.%(ext)s"),
                 "noplaylist": True, "quiet": True, "force_ipv4": True,
                 "sleep_interval": 3, "max_sleep_interval": 8,
-                "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}}
+                "extractor_args": {"youtube": {"player_client": ["web", "tv", "ios", "android"]}}}
         download_errors = []
         info = None
+        downloaded = None
         for attempt in range(1, 4):
             try:
                 with yt_dlp.YoutubeDL(opts) as client:
                     info = client.extract_info(url, download=True)
+                downloaded = next((p for p in folder.glob(f"source_{index:02d}.*")
+                                   if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}), None)
+                if downloaded is None or height(downloaded) < 720:
+                    if downloaded is not None:
+                        rejected = folder / "low_resolution_rejected"
+                        rejected.mkdir(exist_ok=True)
+                        downloaded.replace(rejected / downloaded.name)
+                    info = None
+                    raise ValueError(f"Download for {url} below 720p; refusing blurry source")
                 break
             except Exception as exc:
                 download_errors.append(f"attempt {attempt}/3: {type(exc).__name__}: {exc}")
@@ -482,7 +705,7 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
             raise FileNotFoundError(f"yt-dlp produced no file for source {index}")
         local_files.append(candidates[0])
     (folder / "source_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    title_slug = _slug(youtube_urls, str(metadata[0].get("title") or ""))
+    title_slug = _slug(youtube_urls, str(metadata[0].get("title") or "")) if not existing_project_dir else folder.name
     titled_folder = folder if existing_project_dir else OUTPUTS / title_slug
     if titled_folder.resolve() != folder.resolve():
         if titled_folder.exists():
@@ -495,7 +718,12 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
         else:
             folder.rename(titled_folder)
             folder = titled_folder
-        local_files = [folder / path.name for path in local_files]
+        local_files = [folder / path.name if path.parent == (prior or (OUTPUTS / _slug(youtube_urls))) else path
+                       for path in local_files]
+    (folder / "production_settings.json").write_text(
+        json.dumps({"source_audio_mode": source_audio_mode, "bgm_style": bgm_style,
+                    "niche_mode": niche_mode, "text_blur_mode": text_blur_mode,
+                    "render_settings": render_settings or {}, "transition_style": transition_style}, indent=2), encoding="utf-8")
     # No caption web requests by default; industrial/woodworking videos often have no speech.
     notes = []
     keyframes = []
@@ -606,7 +834,8 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
     chapter_audio = [folder / f"narration_{index:02d}.mp3" for index in range(1, len(script["segments"]) + 1)]
     hook_duration = 8.0 if make_intro_hook else 0.0
     timeline = build_master_audio_and_srt(chapter_audio, script["segments"], folder,
-                                          hook_duration=hook_duration, niche_mode=niche_mode)
+                                          hook_duration=hook_duration, niche_mode=niche_mode,
+                                          bgm_style=bgm_style)
     full_voice = timeline["voice"]
     master_mix = timeline["mix"]
     offsets = [item["start_sec"] for item in timeline["segments"]]
@@ -637,8 +866,9 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
         _run(["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-an", "-c:v", "libx264",
               "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p", str(combined)])
         trimmed = folder / "source_trimmed_outro.mp4"
-        _run(["ffmpeg", "-i", str(combined), "-t", f"{source_runtime-clean_outro_sec:.3f}", "-an",
-              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p", str(trimmed)])
+        _run(["ffmpeg", "-i", str(combined), "-t", f"{source_runtime-clean_outro_sec:.3f}",
+              "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "192k", str(trimmed)])
         render_sources = [trimmed]
     report("Assembling broadcast master")
     render_voice = master_mix
@@ -655,7 +885,10 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
     (folder / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
     video = assemble_and_master_video(render_sources, script, render_voice, folder, report,
                                       exclude_ranges=exclude_ranges, make_intro_hook=make_intro_hook,
-                                      speed_up_source=True, subtitle_path=body_subtitle)
+                                      speed_up_source=True, subtitle_path=body_subtitle,
+                                      source_audio_mode=source_audio_mode, timeline=timeline["segments"],
+                                      text_blur_mode=text_blur_mode, render_settings=render_settings,
+                                      transition_style=transition_style)
     if body_subtitle.name == "subtitle_render_clock.srt":
         body_subtitle.unlink(missing_ok=True)
     info = _probe(video)
@@ -695,7 +928,8 @@ def produce_documentary(youtube_urls: list[str], niche_mode: str = "engineering_
     except Exception:
         pass
     report("Master and thumbnail complete")
-    shorts = generate_shorts_funnel(video, script, folder) if make_shorts else []
+    shorts = generate_shorts_funnel(video, script, folder, text_blur_mode=text_blur_mode,
+                                   render_settings=render_settings) if make_shorts else []
     expected_duration = float(min(int(target_duration_sec), int(usable_duration * 0.96))) + hook_duration
     verification = self_verify_output(folder, hook_duration=hook_duration,
                                       require_shorts=make_shorts,

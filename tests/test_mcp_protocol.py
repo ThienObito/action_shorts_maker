@@ -22,7 +22,8 @@ class ProtocolTests(unittest.TestCase):
                     names = {tool.name for tool in tools.tools}
                     self.assertEqual(names, {'process_youtube_links',
                                              'analyze_video_storyboard',
-                                             'list_completed_projects', 'get_job_status'})
+                                             'list_completed_projects', 'get_job_status',
+                                             'produce_us_documentary', 'open_agent_studio'})
                     result = await client.call_tool('list_completed_projects', {})
                     self.assertFalse(result.isError)
                     invalid = await client.call_tool('process_youtube_links',
@@ -30,5 +31,9 @@ class ProtocolTests(unittest.TestCase):
                     self.assertTrue(invalid.isError)
                     status = await client.call_tool('get_job_status', {})
                     self.assertFalse(status.isError)
+                    preflight = await client.call_tool('produce_us_documentary',
+                                                       {'youtube_urls': ['https://youtu.be/example']})
+                    self.assertFalse(preflight.isError)
+                    self.assertIn('preflight_required', str(preflight.content))
 
         asyncio.run(exchange())

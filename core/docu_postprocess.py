@@ -7,6 +7,101 @@ from pathlib import Path
 
 import numpy as np
 
+TEXT_BLUR_MODES = ("none", "auto_detect_blur", "top_blur_brand",
+                   "bottom_blur_sub", "both_top_bottom_blur")
+
+
+def detect_text_bands(source: Path) -> tuple[bool, bool]:
+    """Conservative visual text-like edge heuristic; always review the result manually.
+
+    This is not OCR and cannot promise removal of a watermark or embedded subtitles.
+    """
+    import cv2
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        raise ValueError(f"Cannot inspect text bands: {source}")
+    votes = [0, 0]
+    try:
+        length = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1
+        for fraction in (.12, .27, .42, .57, .72, .87):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(length * fraction))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            height = len(gray)
+            for index, band in enumerate((gray[:int(height*.16)], gray[int(height*.78):])):
+                band = cv2.resize(band, (640, max(50, int(640*band.shape[0]/band.shape[1]))))
+                edges = cv2.Canny(band, 90, 180)
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                glyphs = sum(1 for contour in contours if
+                             2 <= cv2.boundingRect(contour)[2] <= 45 and
+                             4 <= cv2.boundingRect(contour)[3] <= 42)
+                votes[index] += glyphs >= 26
+    finally:
+        capture.release()
+    return votes[0] >= 4, votes[1] >= 4
+
+
+def apply_frosted_blur_text_mask(width: int, height: int, mode: str,
+                                 strength: int = 88, source_label: str = "v0") -> tuple[str, str]:
+    """Return FFmpeg filter_complex fragment (graph, output label), before ASS burn-in."""
+    if (width, height) not in ((1920, 1080), (1080, 1920)):
+        raise ValueError("Only master 1920x1080 or Shorts 1080x1920 masks supported")
+    if mode not in TEXT_BLUR_MODES or mode == "auto_detect_blur":
+        raise ValueError("Resolve auto_detect_blur against source frames first")
+    if not 0 <= strength <= 100:
+        raise ValueError("Blur strength must be 0..100")
+    top = mode in ("top_blur_brand", "both_top_bottom_blur")
+    bottom = mode in ("bottom_blur_sub", "both_top_bottom_blur")
+    if not top and not bottom:
+        return "", source_label
+    top_h = 135 if width == 1920 else 245
+    bottom_y, bottom_h = ((930, 150) if width == 1920 else (1380, 340))
+    radius = max(1, round(28 * strength / 88))
+    parts = []
+    labels = []
+    if top:
+        labels.append("top")
+    if bottom:
+        labels.append("bottom")
+    parts.append(f"[{source_label}]split={len(labels)+1}[base]" + "".join(f"[{x}src]" for x in labels))
+    current = "base"
+    for part in labels:
+        y, h = (0, top_h) if part == "top" else (bottom_y, bottom_h)
+        border = (f",drawbox=x=0:y={h-(2 if width == 1920 else 4)}:w={width}:"
+                  f"h={2 if width == 1920 else 4}:color=0x00E5FF@0.95:t=fill") if part == "top" else ""
+        parts.append(f"[{part}src]crop={width}:{h}:0:{y},"
+                     f"boxblur=luma_radius={radius}:luma_power=6:chroma_radius={max(1,radius//2)}:chroma_power=4,"
+                     f"eq=brightness=-0.16:contrast=0.88,"
+                     f"drawbox=x=0:y=0:w={width}:h={h}:color=0x0B1320@0.62:t=fill{border}[{part}glass]")
+        parts.append(f"[{current}][{part}glass]overlay=0:{y}[{part}out]")
+        current = f"{part}out"
+    if top:
+        caption = "IRONAXIS LAB // TECHNICAL BREAKDOWN" if width == 1920 else "IRONAXIS LAB"
+        parts.append(f"[{current}]drawtext=fontfile='C\\:/Windows/Fonts/arialbd.ttf':text='{caption}':"
+                     f"fontsize={36 if width == 1920 else 48}:fontcolor=white:borderw=3:bordercolor=black:"
+                     f"x=(w-text_w)/2:y={40 if width == 1920 else 78}" +
+                     (",drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':text='US INDUSTRIAL & CNC ARCHIVE':"
+                      "fontsize=24:fontcolor=0x00E5FF:borderw=2:bordercolor=black:x=(w-text_w)/2:y=142"
+                      if width == 1080 else "") + "[masked]")
+        current = "masked"
+    return ";".join(parts), current
+
+
+def normalize_master_loudness(mix_path: Path) -> float | None:
+    """One-pass ITU loudness target after all beds are mixed; preserve PCM duration."""
+    import shutil
+    temp = mix_path.with_name("master_audio_loudnorm_new.wav")
+    result = subprocess.run(["ffmpeg", "-y", "-nostdin", "-hide_banner", "-i", str(mix_path),
+                             "-af", "loudnorm=I=-14:TP=-1.0:LRA=11:print_format=json",
+                             "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(temp)],
+                            check=True, capture_output=True, text=True, timeout=3600)
+    temp.replace(mix_path)
+    shutil.copy2(mix_path, mix_path.with_name("full_voiceover_mixed.wav"))
+    match = re.search(r'"output_i"\s*:\s*"([^"\n]+)"', result.stderr)
+    return float(match.group(1)) if match else None
+
 
 def srt_timestamp(seconds: float) -> str:
     milliseconds = max(0, round(seconds * 1000))
@@ -19,7 +114,7 @@ def srt_timestamp(seconds: float) -> str:
 def build_master_audio_and_srt(audio_files: list[Path], segments: list[dict], project_dir: Path,
                                hook_duration: float = 0.0, chapter_gap: float = 2.0,
                                tail_sec: float = 1.5, max_words: int = 9,
-                               niche_mode: str = "engineering_machining") -> dict:
+                               niche_mode: str = "engineering_machining", bgm_style: str = "dynamic_multi") -> dict:
     """Build measured master voice, SRT, timeline and ducked procedural BGM on one clock."""
     from pydub import AudioSegment
     import numpy as np
@@ -62,7 +157,8 @@ def build_master_audio_and_srt(audio_files: list[Path], segments: list[dict], pr
 
     from core.bgm_composer import compose_dynamic_bgm
     bgm = compose_dynamic_bgm(project_dir, total_ms, timeline,
-                              hook_duration=hook_duration, niche_mode=niche_mode)
+                               hook_duration=hook_duration, niche_mode=niche_mode, bgm_style=bgm_style)
+    bgm.export(project_dir / "bgm_master.wav", format="wav")
     mixed = bgm.overlay(voice).set_frame_rate(48000).set_channels(2)
     mixed_path = project_dir / "master_audio_mix.wav"
     mixed.export(mixed_path, format="wav", parameters=["-ar", "48000"])
@@ -121,7 +217,6 @@ def self_verify_output(project_dir: Path, hook_duration: float = 0.0,
         return float(data["format"]["duration"])
     master_duration, voice_duration = duration(master), duration(voice)
     from pydub import AudioSegment
-    from pydub import AudioSegment
     import json as _json
     timeline_file = project_dir / "english_narration_timeline.json"
     timeline_data = _json.loads(timeline_file.read_text(encoding="utf-8")) if timeline_file.is_file() else {}
@@ -167,7 +262,9 @@ def self_verify_output(project_dir: Path, hook_duration: float = 0.0,
     target_ok = (master_duration >= minimum_runtime_sec and
                  (target_delta is None or target_delta <= target_tolerance))
     errors = []
-    if intro_bgm_dbfs < -25.0:
+    settings_path = project_dir / "production_settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
+    if settings.get("bgm_style", "dynamic_multi") != "none" and intro_bgm_dbfs < -25.0:
         errors.append("BGM missing or too quiet in Intro/Gaps")
     if master_duration < minimum_runtime_sec:
         errors.append(f"Master runtime {master_duration:.3f}s below mid-roll minimum {minimum_runtime_sec:.1f}s")

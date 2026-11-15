@@ -89,17 +89,42 @@ def process_youtube_links(urls: list[str] | str, mode: str = 'short', max_clips:
 
 
 @server.tool()
-def produce_us_documentary(youtube_urls: list[str], niche_mode: str = 'engineering_machining',
+def produce_us_documentary(youtube_urls: list[str], niche_mode: str | None = None,
                            target_duration_sec: int = 600, background: bool = True,
                            clean_outro_sec: float = 0, voice: str = 'en-US-ChristopherNeural',
                            exclude_ranges: list[list[float]] | None = None,
-                           make_intro_hook: bool = False, make_shorts: bool = True) -> dict:
-    """Prepare original US-English documentary narration for cleared source footage."""
+                           make_intro_hook: bool = True, make_shorts: bool = True,
+                           source_audio_mode: str | None = None, bgm_style: str | None = None,
+                           text_blur_mode: str | None = None,
+                           transition_style: str = 'none') -> dict:
+    """Pre-flight required: ask user source_audio_mode, text_blur_mode, bgm_style, niche_mode.
+
+    Audio: mute_all / extract_env_sfx (Demucs 4-stem other, audition required) / keep_raw_low.
+    Music: dynamic_multi / industrial / precision / craft / foundry / mystery / triumph / none.
+    Niche: engineering_machining / woodworking_bonsai / survival_commentary.
+    English AI narration, master captions and three ASS-captioned Shorts are mandatory.
+    """
     if not youtube_urls or not all(isinstance(url, str) and url.startswith(('https://', 'http://'))
                                    for url in youtube_urls):
         raise ValueError('youtube_urls must be a nonempty list of HTTP(S) URLs')
+    if source_audio_mode is None or bgm_style is None or niche_mode is None or text_blur_mode is None:
+        return {'status': 'preflight_required', 'message': 'Ask the user to choose source audio, blur, music and niche before starting.',
+                 'source_audio_mode': ['mute_all', 'extract_env_sfx', 'keep_raw_low'],
+                 'text_blur_mode': ['auto_detect_blur', 'top_blur_brand', 'bottom_blur_sub', 'both_top_bottom_blur', 'none'],
+                 'bgm_style': ['dynamic_multi', 'industrial', 'precision', 'craftsman', 'craft', 'foundry', 'mystery', 'triumph', 'none'],
+                'niche_mode': ['engineering_machining', 'woodworking_bonsai', 'survival_commentary']}
     if niche_mode not in ('engineering_machining', 'woodworking_bonsai', 'survival_commentary'):
         raise ValueError('Unsupported niche_mode')
+    if source_audio_mode not in ('mute_all', 'extract_env_sfx', 'keep_raw_low'):
+        raise ValueError('Unsupported source_audio_mode')
+    if text_blur_mode not in ('auto_detect_blur', 'top_blur_brand', 'bottom_blur_sub', 'both_top_bottom_blur', 'none'):
+        raise ValueError('Unsupported text_blur_mode')
+    if bgm_style not in ('dynamic_multi', 'industrial', 'precision', 'craftsman', 'craft', 'foundry', 'mystery', 'triumph', 'none'):
+        raise ValueError('Unsupported bgm_style')
+    if transition_style not in ('none', 'cross_dissolve', 'flash_cut', 'zoom_punch', 'dip_black', 'whip_pan'):
+        raise ValueError('Unsupported transition_style')
+    if not make_intro_hook or not make_shorts:
+        raise ValueError('English AI narration, Intro Hook and three captioned Shorts are required')
     if target_duration_sec < 60:
         raise ValueError('target_duration_sec must be at least 60')
     job_id = uuid4().hex[:12]
@@ -113,7 +138,10 @@ def produce_us_documentary(youtube_urls: list[str], niche_mode: str = 'engineeri
             result = produce_documentary(youtube_urls, niche_mode, target_duration_sec, progress,
                                          clean_outro_sec=clean_outro_sec, voice=voice,
                                          exclude_ranges=[tuple(r) for r in (exclude_ranges or [])],
-                                         make_intro_hook=make_intro_hook, make_shorts=make_shorts)
+                                         make_intro_hook=make_intro_hook, make_shorts=make_shorts,
+                                         source_audio_mode=source_audio_mode, bgm_style=bgm_style,
+                                          text_blur_mode=text_blur_mode,
+                                          transition_style=transition_style)
             _record(job_id, 'completed', 100, 'Documentary render complete', result=result)
         except Exception as exc:
             _record(job_id, 'failed', 100, f'{type(exc).__name__}: {exc}')
@@ -124,6 +152,36 @@ def produce_us_documentary(youtube_urls: list[str], niche_mode: str = 'engineeri
     work()
     path = JOBS / f'{job_id}.json'
     return json.loads(path.read_text(encoding='utf-8'))
+
+
+@server.tool()
+def open_agent_studio() -> dict:
+    """Open the local IronAxis Studio at 127.0.0.1:8765; does not queue or render projects."""
+    import socket
+    import subprocess
+    import webbrowser
+    url = 'http://127.0.0.1:8765'
+    try:
+        with socket.create_connection(('127.0.0.1', 8765), timeout=.5):
+            pass
+    except OSError:
+        flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve().parent / 'studio_server.py')],
+                         cwd=Path(__file__).resolve().parent, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        for _ in range(20):
+            if process.poll() is not None:
+                raise RuntimeError('Studio server terminated during startup')
+            try:
+                with socket.create_connection(('127.0.0.1', 8765), timeout=.5):
+                    break
+            except OSError:
+                time.sleep(.15)
+        else:
+            raise RuntimeError('Studio server did not bind to 127.0.0.1:8765')
+    opened = webbrowser.open(url)
+    return {'url': url, 'status': 'ready', 'browser_opened': opened,
+            'note': 'Preflight requires four explicit choices before any job.'}
 
 
 @server.tool()

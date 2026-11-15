@@ -103,7 +103,14 @@ def _compose_track(path: Path, style: str, bpm: int, roots: tuple[float, ...], m
 
 
 def compose_dynamic_bgm(project_dir: Path, duration_ms: int, timeline: list[dict],
-                        hook_duration: float = 0.0, niche_mode: str = "engineering_machining") -> AudioSegment:
+                        hook_duration: float = 0.0, niche_mode: str = "engineering_machining",
+                        bgm_style: str = "dynamic_multi") -> AudioSegment:
+    if bgm_style == "craftsman":
+        bgm_style = "craft"
+    if bgm_style not in (*TRACKS, "dynamic_multi", "none"):
+        raise ValueError(f"Unsupported bgm_style: {bgm_style}")
+    if bgm_style == "none":
+        return AudioSegment.silent(duration=duration_ms, frame_rate=48000).set_channels(2)
     files = ensure_bgm_library()
     builtins = {key: LIBRARY / value[0] for key, value in TRACKS.items()}
     extras = [path for path in files if path.name not in {p.name for p in builtins.values()}
@@ -112,9 +119,11 @@ def compose_dynamic_bgm(project_dir: Path, duration_ms: int, timeline: list[dict
     for index, item in enumerate(timeline):
         chapter = int(item.get("chapter", index+1))
         style = ("industrial", "precision", "mystery", "foundry", "triumph", "craft")[(chapter-1)%6]
-        if niche_mode == "woodworking_bonsai" and chapter in (2,3):
+        if niche_mode == "woodworking_bonsai" and chapter in (2,3) and bgm_style == "dynamic_multi":
             style = "craft"
-        path = random.Random(20261114+chapter).choice(extras) if extras and chapter % 4 == 0 else builtins[style]
+        if bgm_style != "dynamic_multi":
+            style = bgm_style
+        path = random.Random(20261114+chapter).choice(extras) if extras and chapter % 4 == 0 and bgm_style == "dynamic_multi" else builtins[style]
         track = AudioSegment.from_file(path).set_frame_rate(48000).set_channels(2)
         chapter_tracks.append((max(0, round(item["start_sec"]*1000)), _tile(track, duration_ms)))
     if not chapter_tracks:
@@ -132,12 +141,12 @@ def compose_dynamic_bgm(project_dir: Path, duration_ms: int, timeline: list[dict
         if index+1 < len(chapter_tracks):
             nxt = chapter_tracks[index+1][1][:1200].fade_in(1200)
             bgm = bgm.overlay(nxt, position=max(start,end-1200))
-    # Set BGM to audible absolute RMS targets: -13dBFS gaps/hooks, -17.5dBFS under VO.
+    # Audible absolute RMS targets: -14 dBFS gaps/hooks, -18.5 dBFS under VO.
     samples = np.asarray(bgm.get_array_of_samples(), dtype=np.float32).reshape(-1,2)
-    envelope = np.full(duration_ms, -13.0, dtype=np.float32)
+    envelope = np.full(duration_ms, -14.0, dtype=np.float32)
     voice_spans = [(max(0,round(x["start_sec"]*1000)), min(duration_ms,round(x["end_sec"]*1000))) for x in timeline]
     for start,end in voice_spans:
-        if end > start: envelope[start:end] = -17.5
+        if end > start: envelope[start:end] = -18.5
     ramp=300
     for point in np.flatnonzero(np.diff(envelope))+1:
         lo,hi=max(0,point-ramp//2),min(duration_ms,point+ramp//2)
