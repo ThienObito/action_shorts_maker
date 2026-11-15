@@ -405,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT / "studio_ui.html").read_bytes(), "text/html; charset=utf-8")
             elif uri.path == '/studio_enhancements.js':
                 self.send((ROOT / 'studio_enhancements.js').read_bytes(), 'text/javascript; charset=utf-8')
+            elif uri.path == '/studio_theme.css':
+                self.send((ROOT / 'studio_theme.css').read_bytes(), 'text/css; charset=utf-8')
             elif uri.path == "/api/projects":
                 self.send_json({'projects': listed_projects()})
             elif uri.path == "/api/status":
