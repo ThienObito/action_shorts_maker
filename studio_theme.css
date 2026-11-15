@@ -264,3 +264,231 @@ header {
 @media (prefers-reduced-motion: reduce) {
   *, *:before, *:after { animation: none !important; transition: none !important; }
 }
+
+/* Water-droplet optics: preserve the Studio's geometry and interaction layers. */
+:root {
+  --drop-surface: linear-gradient(135deg, rgba(255,255,255,.10), rgba(255,255,255,.025) 48%, rgba(0,235,255,.04));
+  --drop-drawer: linear-gradient(145deg, rgba(255,255,255,.13), rgba(255,255,255,.025) 55%, rgba(16,185,129,.04));
+  --drop-rim: 0 14px 36px rgba(0,0,0,.42), inset 0 1.5px 1px rgba(255,255,255,.72), inset 0 -1.5px 2px rgba(0,240,255,.35), inset 1px 0 1px rgba(255,255,255,.28), inset -1px 0 1px rgba(255,255,255,.15), inset 0 0 18px rgba(255,255,255,.05);
+  --drop-rim-hover: 0 16px 40px rgba(0,229,255,.22), inset 0 2px 1.5px rgba(255,255,255,.92), inset 0 -2px 3px rgba(0,240,255,.52), inset 1.5px 0 1.5px rgba(255,255,255,.48), inset -1.5px 0 1.5px rgba(255,255,255,.32);
+}
+html, body { overflow: hidden; }
+body {
+  background: radial-gradient(circle at 22% 28%, rgba(16,185,129,.26), transparent 46%),
+    radial-gradient(circle at 78% 24%, rgba(0,212,255,.25), transparent 48%),
+    radial-gradient(circle at 52% 76%, rgba(245,158,11,.18), transparent 52%),
+    linear-gradient(160deg, #04111f, #020710 55%, #030914);
+}
+body > *:not(#threeBgCanvas):not(#liquidSvgDefs) { position: relative; z-index: 2; }
+#liquidSvgDefs { position: fixed; width: 0; height: 0; pointer-events: none; }
+header, .panel, #program, #timeline, .box, .dialog, .glass-drawer {
+  background: var(--drop-surface);
+  backdrop-filter: blur(7px) saturate(210%) brightness(1.08);
+  -webkit-backdrop-filter: blur(7px) saturate(210%) brightness(1.08);
+  border: 1px solid rgba(255,255,255,.24);
+  box-shadow: var(--drop-rim);
+  border-radius: 16px;
+}
+header {
+  border-radius: 0;
+  background: linear-gradient(90deg, rgba(255,255,255,.12), rgba(255,255,255,.04) 50%, rgba(0,229,255,.08));
+  border-bottom-color: rgba(255,255,255,.26);
+  z-index: 4 !important;
+}
+#program { background: linear-gradient(160deg, rgba(255,255,255,.07), rgba(6,16,32,.18)); }
+.glass-drawer, .box { background: var(--drop-drawer); border-radius: 14px; }
+.glass-drawer { isolation: isolate; }
+.glass-drawer::before, .box::before {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: -1;
+  background: linear-gradient(135deg, rgba(255,255,255,.22), rgba(255,255,255,.02) 38%, transparent 60%);
+}
+/* Distort only a narrow specular rim, not text or clickable content. */
+.glass-drawer::after, .box::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  border: 1px solid rgba(255,255,255,.16); opacity: .65;
+  filter: url(#liquid-refraction);
+}
+.glass-drawer:hover { border-color: rgba(255,255,255,.48); box-shadow: var(--drop-rim-hover); }
+.glass-drawer summary {
+  color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.65);
+  background: linear-gradient(90deg, rgba(255,255,255,.14), rgba(255,255,255,.02));
+  border-bottom-color: rgba(255,255,255,.14);
+}
+.glass-drawer label, .glass-drawer .hint, .muted { color: #c4dcf5; }
+.logo, .badge, .tag, .monitor-badge {
+  background: linear-gradient(135deg, rgba(255,255,255,.18), rgba(255,255,255,.03));
+  border-color: rgba(255,255,255,.3);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.65), 0 3px 10px rgba(0,0,0,.25);
+  border-radius: 999px;
+}
+.logo { color: #fff; text-shadow: 0 0 14px rgba(0,240,255,.75); }
+button, select, input:not([type=checkbox]):not([type=range]) {
+  background: linear-gradient(145deg, rgba(255,255,255,.15), rgba(255,255,255,.03) 65%, rgba(0,229,255,.06));
+  backdrop-filter: blur(8px) saturate(200%) brightness(1.08);
+  -webkit-backdrop-filter: blur(8px) saturate(200%) brightness(1.08);
+  border-color: rgba(255,255,255,.24);
+  box-shadow: 0 4px 14px rgba(0,0,0,.25), inset 0 1.2px .8px rgba(255,255,255,.68), inset 0 -1px 1.5px rgba(0,229,255,.24);
+  border-radius: 10px;
+  text-shadow: 0 1px 2px rgba(0,0,0,.55);
+}
+button:hover:not(:disabled), select:hover, input:not([type=checkbox]):not([type=range]):focus, .asset:hover, .agent:hover {
+  border-color: rgba(255,255,255,.7);
+  background: linear-gradient(145deg, rgba(255,255,255,.24), rgba(0,229,255,.10));
+  box-shadow: 0 6px 20px rgba(0,229,255,.28), inset 0 1.5px 1px rgba(255,255,255,.9), inset 0 -1.5px 2px rgba(0,240,255,.45);
+}
+.glass-drawer input:not([type=checkbox]):not([type=range]), .glass-drawer select {
+  background: linear-gradient(145deg, rgba(255,255,255,.15), rgba(10,22,40,.18));
+  border-color: rgba(255,255,255,.28);
+  border-radius: 10px;
+}
+.asset, .agent {
+  background: linear-gradient(145deg, rgba(255,255,255,.18), color-mix(in srgb, var(--tone) 14%, rgba(255,255,255,.03)));
+  border-color: color-mix(in srgb, var(--tone) 55%, rgba(255,255,255,.4));
+  box-shadow: 0 6px 18px rgba(0,0,0,.28), inset 0 1.5px 1px rgba(255,255,255,.78), inset 0 -1px 2px color-mix(in srgb, var(--tone) 35%, transparent);
+  border-radius: 12px;
+}
+.asset:hover, .asset.selected { box-shadow: 0 0 22px color-mix(in srgb, var(--tone) 52%, transparent), inset 0 2px 1.5px rgba(255,255,255,.95), inset 0 -2px 3px var(--tone); }
+.asset small, .agent small { color: #e3f3ff; }
+.clip {
+  background: linear-gradient(180deg, rgba(255,255,255,.36), color-mix(in srgb, var(--tone) 48%, rgba(12,24,42,.45)));
+  border-color: color-mix(in srgb, var(--tone) 75%, #fff);
+  box-shadow: inset 0 1px .8px rgba(255,255,255,.8), 0 2px 6px rgba(0,0,0,.25);
+  border-radius: 10px;
+}
+.clip:hover { box-shadow: 0 0 14px var(--tone), inset 0 1.5px 1px #fff; }
+.tabs button.active { background: linear-gradient(135deg, #fff, #67e8f9 60%, #22d3ee); border-color: #fff; text-shadow: none; }
+.monitor { background: radial-gradient(circle at 50% 45%, rgba(255,255,255,.06), rgba(4,12,24,.22) 70%); }
+.program-head, .transport { background: linear-gradient(90deg, rgba(255,255,255,.12), rgba(255,255,255,.02)); }
+.transport .play { background: linear-gradient(135deg, #fff3a1, #fbbf24 55%, #f59e0b); color: #09101a; text-shadow: none; }
+#notice { background: rgba(8,18,34,.25); }
+.sticky-actions { background: linear-gradient(145deg, rgba(255,255,255,.16), rgba(8,22,42,.38)); backdrop-filter: blur(7px) saturate(210%); -webkit-backdrop-filter: blur(7px) saturate(210%); box-shadow: var(--drop-rim); }
+.ruler-row { background: rgba(255,255,255,.07); }
+.track-label { background: rgba(255,255,255,.05); color: #e4f3ff; }
+.lane { background: repeating-linear-gradient(90deg, rgba(255,255,255,.02) 0%, rgba(255,255,255,.06) 10%, rgba(255,255,255,.02) 10.08%); }
+
+/* Pitch-black obsidian: replace the former emerald/cyan washes, not the layout. */
+:root {
+  background: #000;
+  --mx: 50vw; --my: 50vh;
+  --obsidian-panel: linear-gradient(145deg, rgba(12,16,26,.42), rgba(6,9,15,.42));
+  --obsidian-drawer: linear-gradient(155deg, rgba(255,255,255,.065), rgba(10,14,22,.42) 52%, rgba(0,242,254,.018));
+  --obsidian-rim: 0 18px 45px rgba(0,0,0,.85), inset 0 1px .5px rgba(255,255,255,.65), inset 0 -1px 2px rgba(0,240,255,.28), inset 1px 0 .5px rgba(255,255,255,.18), inset -1px 0 .5px rgba(255,255,255,.12);
+  --obsidian-hover: 0 18px 45px rgba(0,0,0,.9), 0 0 22px rgba(0,242,254,.24), inset 0 1.5px 1px rgba(255,255,255,.9), inset 0 -1.5px 2px rgba(139,92,246,.55);
+}
+html { background: #000; }
+body {
+  background: radial-gradient(650px circle at var(--mx) var(--my), rgba(0,242,254,.035), transparent 65%),
+    radial-gradient(circle, rgba(188,224,255,.13) .5px, transparent .8px) 0 0 / 27px 27px,
+    #010204;
+}
+body::before {
+  content: ''; position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 43%, transparent 15%, rgba(0,0,0,.54) 85%, rgba(0,0,0,.8));
+}
+header, .panel, #program, #timeline, .box, .dialog, .glass-drawer {
+  background: var(--obsidian-panel);
+  backdrop-filter: blur(12px) saturate(190%);
+  -webkit-backdrop-filter: blur(12px) saturate(190%);
+  border-color: rgba(255,255,255,.16);
+  box-shadow: var(--obsidian-rim);
+  border-radius: 15px;
+}
+header {
+  border-radius: 0; z-index: 4 !important;
+  background: linear-gradient(90deg, rgba(10,14,22,.68), rgba(4,6,10,.58), rgba(10,16,26,.68));
+  border-bottom-color: rgba(255,255,255,.18);
+}
+#program { background: linear-gradient(160deg, rgba(12,16,26,.38), rgba(2,4,8,.55)); }
+.glass-drawer, .box { background: var(--obsidian-drawer); }
+.glass-drawer { transition: transform .3s cubic-bezier(.22,1,.36,1), border-color .3s, box-shadow .3s; }
+.glass-drawer:hover { transform: translateY(-2px) scale(1.005); border-color: rgba(0,242,254,.6); box-shadow: var(--obsidian-hover); }
+.glass-drawer::before, .box::before, .panel::before {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: -1;
+  background: radial-gradient(240px circle at var(--spot-x,-500px) var(--spot-y,-500px), rgba(255,255,255,.13), rgba(0,242,254,.045) 38%, transparent 75%),
+    linear-gradient(135deg, rgba(255,255,255,.08), transparent 40%);
+}
+.panel { isolation: isolate; }
+.glass-drawer summary { position: relative; overflow: hidden; color: #f5faff; background: linear-gradient(90deg, rgba(255,255,255,.075), rgba(0,0,0,.12)); }
+.glass-drawer summary:hover { color: #85faff; background: linear-gradient(90deg, rgba(0,242,254,.12), rgba(0,0,0,.14)); }
+.glass-drawer summary::before, button::after, .clip::after {
+  content: ''; position: absolute; top: -60%; left: -120%; width: 60%; height: 220%; z-index: 2;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.38), transparent);
+  transform: rotate(25deg); transition: left .58s cubic-bezier(.16,1,.3,1); pointer-events: none;
+}
+.glass-drawer:hover summary::before, button:hover:not(:disabled)::after, .clip:hover::after { left: 140%; }
+.logo, .badge, .tag, .monitor-badge {
+  background: linear-gradient(135deg, rgba(255,255,255,.11), rgba(6,10,18,.65));
+  border-color: rgba(255,255,255,.22);
+  box-shadow: inset 0 1px .5px rgba(255,255,255,.55), 0 4px 12px rgba(0,0,0,.65);
+}
+button, select, input:not([type=checkbox]):not([type=range]) {
+  background: linear-gradient(145deg, rgba(255,255,255,.09), rgba(12,16,24,.65));
+  backdrop-filter: blur(12px) saturate(190%);
+  -webkit-backdrop-filter: blur(12px) saturate(190%);
+  border-color: rgba(255,255,255,.18);
+  box-shadow: 0 6px 16px rgba(0,0,0,.65), inset 0 1px .5px rgba(255,255,255,.55), inset 0 -1px 1px rgba(0,242,254,.18);
+  transition: transform .28s cubic-bezier(.22,1,.36,1), box-shadow .28s, border-color .28s, background .28s;
+}
+button { position: relative; overflow: hidden; }
+button:hover:not(:disabled), select:hover, input:not([type=checkbox]):not([type=range]):focus {
+  border-color: rgba(0,242,254,.75);
+  background: linear-gradient(145deg, rgba(255,255,255,.16), rgba(0,242,254,.1) 55%, rgba(12,18,30,.72));
+  box-shadow: 0 8px 24px rgba(0,0,0,.8), 0 0 20px rgba(0,242,254,.3), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 -1.5px 2px rgba(0,242,254,.5);
+  transform: translateY(-2px) scale(1.015);
+}
+button:active:not(:disabled), .asset:active, .agent:active, .clip:active { transform: translateY(1px) scale(.95); transition-duration: .08s; }
+button:disabled { opacity: .36; }
+.water-ripple {
+  position: absolute; display: block; border-radius: 50%; pointer-events: none; z-index: 8;
+  background: radial-gradient(circle, rgba(255,255,255,.72), rgba(0,242,254,.45) 44%, transparent 70%);
+  transform: translate(-50%,-50%) scale(0); animation: waterRipple .6s cubic-bezier(.16,1,.3,1) forwards;
+}
+@keyframes waterRipple { to { transform: translate(-50%,-50%) scale(3.8); opacity: 0; } }
+.glass-drawer input:not([type=checkbox]):not([type=range]), .glass-drawer select { background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(5,8,14,.7)); }
+.glass-drawer input[type=checkbox] { background: rgba(8,12,20,.85); border-color: rgba(255,255,255,.28); }
+.asset, .agent {
+  position: relative; overflow: hidden;
+  background: linear-gradient(145deg, rgba(255,255,255,.1), color-mix(in srgb, var(--tone) 12%, rgba(6,9,16,.72)));
+  box-shadow: 0 10px 24px rgba(0,0,0,.75), inset 0 1.5px 1px rgba(255,255,255,.62);
+}
+.asset:hover, .agent:hover { transform: translateY(-2px) scale(1.015); border-color: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.9), 0 0 22px color-mix(in srgb, var(--tone) 60%, transparent), inset 0 2px 1.5px #fff; }
+.asset.selected { box-shadow: 0 0 20px color-mix(in srgb, var(--tone) 40%, transparent), inset 0 1px 1px #fff; }
+.clip { overflow: hidden; background: linear-gradient(180deg, rgba(255,255,255,.25), color-mix(in srgb, var(--tone) 45%, rgba(6,10,18,.78))); }
+.clip:hover { transform: translateY(-1px) scale(1.015); box-shadow: 0 0 16px var(--tone), inset 0 1.5px 1px #fff; z-index: 3; }
+.monitor { background: radial-gradient(circle at 50% 50%, rgba(16,24,40,.2), rgba(0,0,0,.78) 80%); }
+.program-head, .transport { background: linear-gradient(90deg, rgba(14,18,28,.6), rgba(4,6,12,.7)); }
+#sheet { background: linear-gradient(145deg, rgba(10,14,24,.82), rgba(2,4,8,.9)); }
+#notice { background: rgba(2,4,8,.8); }
+.sticky-actions { background: linear-gradient(145deg, rgba(16,22,34,.7), rgba(4,6,12,.85)); box-shadow: var(--obsidian-rim); }
+.ruler-row { background: rgba(8,12,20,.65); }
+.track-label { background: rgba(4,6,12,.6); }
+.lane { background: repeating-linear-gradient(90deg, rgba(4,6,12,.52) 0%, rgba(12,18,30,.52) 10%, rgba(4,6,12,.52) 10.08%); }
+.modal { background: rgba(0,0,0,.78); }
+/* Keep open inspector drawers at their intrinsic height so the column can scroll. */
+#inspector { overflow-y: auto; overscroll-behavior-y: contain; }
+#inspector > .glass-drawer, #inspector > .sticky-actions { flex: 0 0 auto; }
+@media (prefers-reduced-motion: reduce) {
+  .water-ripple { display: none; }
+  button::after, .clip::after, .glass-drawer summary::before { transition: none; }
+}
+
+/* Narrow screens need a scrollable workspace, not three compressed columns. */
+@media (max-width: 1050px) {
+  .workspace { flex-direction: column; overflow-x: hidden; overflow-y: auto; gap: 7px; padding-bottom: 7px; }
+  #program { order: 0; width: 100%; flex: 0 0 420px; min-height: 420px; }
+  #library, #inspector { order: 1; width: 100%; flex: 0 0 auto; max-width: none; overflow: visible; }
+  #inspector { order: 2; display: block; }
+  #inspector > .sticky-actions { position: static; }
+  .program-head, .transport { overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+  .program-head > *, .transport > * { flex-shrink: 0; }
+  .program-head select { flex: 0 0 165px; }
+  .transport .transport-spacer { flex: 1 1 12px; }
+}
+@media (max-width: 600px) {
+  header { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  header::-webkit-scrollbar { display: none; }
+  header > * { flex-shrink: 0; }
+  header .spacer { min-width: 0; flex: 1 1 0; }
+  #program { flex-basis: 380px; min-height: 380px; }
+  .monitor { padding: 7px; }
+}
